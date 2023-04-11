@@ -8,11 +8,18 @@ on:
       - 'v*.*'
 
 jobs:
-  docker:
+  build:
     name: Docker
     runs-on: ubuntu-latest
+    outputs:
+      image_digest: ${{ steps.digest.outputs.image_digest }}
+      sbom_digest: ${{ steps.artifacts.outputs.sbom_digest }}
+      version: ${{ steps.prep.outputs.version }}
     permissions:
-      id-token: 'write'
+      packages: write # to push container images to ghcr.io
+      actions: read # To read the workflow path.
+      id-token: write # To sign the provenance.
+      contents: write # To add assets to a release.
     steps:
       - name: Check out code
         uses: actions/checkout@v3
@@ -51,11 +58,11 @@ jobs:
             VERSION="pr-${{ github.event.number }}"
           fi
           VERSION="$(echo "${VERSION}" | sed -r 's#/+#-#g')"
-          echo "::set-output name=version::${VERSION}"
-          echo "::set-output name=base_name::${BASE_NAME}"
-          echo "::set-output name=base_digest::${BASE_DIGEST}"
-          echo "::set-output name=created::$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          echo "::set-output name=date_commit::$(date -d "@$(git log -1 --format=%at)" +%Y-%m-%dT%H:%M:%SZ --utc)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "base_name=${BASE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "base_digest=${BASE_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          echo "date_commit=$(date -d "@$(git log -1 --format=%at)" +%Y-%m-%dT%H:%M:%SZ --utc)" >> "$GITHUB_OUTPUT"
 
       - name: Verify go fmt
         run: test -z "$(go fmt ./...)"
@@ -66,13 +73,9 @@ jobs:
       - name: Test
         run: make test
 
-      # TODO: use GHA versions of linters
-      # - name: Linting
-      #   run: make lint
-
       - name: Build
         uses: docker/build-push-action@v2
-        id: build
+        id: docker
         with:
           context: .
           # platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64,linux/ppc64le,linux/s390x
@@ -83,6 +86,18 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           outputs: |
             type=oci,dest=oci-layout.tar
+
+      - name: digests and metadata information
+        id: digest
+        env:
+          METADATA: ${{ steps.docker.outputs.metadata }}
+        run: |
+            jq -r '.["containerimage.digest"]' <<<"$METADATA" > image-digest
+            # bas64 encoded digest
+            DIGEST=$(cat image-digest)
+            BASE64_DIGEST=$(echo -n ghcr.io/developer-guy/demo-gha-with-oci-layout@$DIGEST image.tar | awk -F':' '{print $2}' | base64 -w0)
+            echo "Base64 encoded digest from image is: $BASE64_DIGEST"
+            echo "image_digest=$BASE64_DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Convert to OCIDir
         run: regctl image import ocidir://oci-layout oci-layout.tar
@@ -108,41 +123,103 @@ jobs:
         uses: anchore/scan-action@v3
         with:
           image: "oci-dir:oci-layout"
+          fail-build: true
+          severity-cutoff: critical
 
       - name: Attach artifacts to image
         id: artifacts
         run: |
           sbom_digest=$(regctl artifact put \
-            --config-media-type application/vnd.oci.image.config.v1+json \
-            -f sbom.json --media-type "application/vnd.cyclonedx+json" \
+            --artifact-type application/vnd.oci.image.config.v1+json \
+            -f sbom.json --file-media-type "application/vnd.cyclonedx+json" \
             --annotation org.opencontainers.artifact.type=sbom \
             --annotation org.example.sbom.type=cyclonedx-json \
             --format '{{ .Manifest.GetDescriptor.Digest }}' \
-            --refers ocidir://oci-layout:latest)
-          echo "::set-output name=sbom_digest::${sbom_digest}"
+            --subject ocidir://oci-layout:latest)
+          echo "sbom_digest=${sbom_digest}" >> "$GITHUB_OUTPUT"
+      
+      - name: Create tar file from mutated oci-layout
+        run: tar -cvf image.tar oci-layout
 
-      - name: zot
-        run: |
-          docker run --rm -d --name zot \
-            -p 127.0.0.1:5000:5000 \
-            -u "$(id -u):$(id -g)" \
-            -v "$(pwd)/oci-layout:/var/lib/registry/demo" \
-            ghcr.io/project-zot/zot-linux-amd64:v1.4.0
-          curl -s http://localhost:5000/v2/ -o /dev/null || sleep 2
+      - uses: actions/upload-artifact@v3
+        with:
+          name: oci-layout
+          path: image.tar # or path/to/artifact
 
-      - name: sign
-        env:
-          COSIGN_EXPERIMENTAL: "true"
-        run: |
-          cosign sign "localhost:5000/demo:latest"
-          cosign sign "localhost:5000/demo@${{ steps.artifacts.outputs.sbom_digest }}"
+  provenance:
+    permissions:
+      id-token: write
+      contents: write
+      actions: read
+    needs: build
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v1.5.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.image_digest }}"
+      upload-assets: false
+  
+  login-and-push:
+    permissions:
+      packages: write
+      id-token: write
+      actions: read
+    name: Upload Everything into Registry
+    runs-on: ubuntu-latest
+    needs: [build, provenance]
+    steps:
+    - name: Download attestations
+      uses: actions/download-artifact@fb598a63ae348fa914e94cd0ff38f362e927b741 # v3.0.0
+      with:
+        name: ${{ needs.provenance.outputs.provenance-name }}
+    
+    - name: Download oci-layout
+      uses: actions/download-artifact@fb598a63ae348fa914e94cd0ff38f362e927b741 # v3.0.0
+      with:
+        name: oci-layout
+    
+    - name: Install regctl
+      uses: regclient/actions/regctl-installer@main
+    
+    - name: Install cosign
+      uses: sigstore/cosign-installer@main
+    
+    - name: Untar oci-layout
+      run: tar -xvf image.tar
 
-      - name: login and push
-        run: |
+    - name: Attach artifacts to image
+      id: artifacts
+      env:
+        PROVENANCE: ${{ needs.provenance.outputs.provenance-name }}
+      run: |
+        slsa_digest=$(regctl artifact put \
+          --artifact-type application/vnd.oci.image.config.v1+yaml \
+          -f $PROVENANCE --file-media-type "application/vnd.slsaprovenancev02+json" \
+          --format '{{ .Manifest.GetDescriptor.Digest }}' \
+          --subject ocidir://oci-layout:latest)
+        echo "slsa_digest=${slsa_digest}" >> "$GITHUB_OUTPUT"
+    
+    - name: zot
+      run: |
+        docker run --rm -d --name zot \
+          -p 127.0.0.1:5000:5000 \
+          -u "$(id -u):$(id -g)" \
+          -v "$(pwd)/oci-layout:/var/lib/registry/demo" \
+          ghcr.io/project-zot/zot-linux-amd64:v1.4.0
+        curl -s http://localhost:5000/v2/ -o /dev/null || sleep 2
+
+    - name: sign
+      env:
+        COSIGN_YES: "true"
+      run: |
+        cosign sign "localhost:5000/demo:latest"
+        cosign sign "localhost:5000/demo@${{ needs.build.outputs.sbom_digest }}"
+        cosign sign "localhost:5000/demo@${{ steps.artifacts.outputs.slsa_digest }}"
+    
+    - name: login and push
+      run: |
           regctl registry login \
             -u "${{ github.repository_owner }}" \
             -p "${{ secrets.GITHUB_TOKEN }}" \
             ghcr.io
           regctl image copy --digest-tags -v info \
             ocidir://oci-layout:latest \
-            ghcr.io/developer-guy/demo-gha-with-oci-layout:${{ steps.prep.outputs.version }}
+            ghcr.io/developer-guy/demo-gha-with-oci-layout:${{ needs.build.outputs.version }}
