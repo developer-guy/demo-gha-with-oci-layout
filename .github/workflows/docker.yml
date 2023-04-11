@@ -17,10 +17,10 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v3
 
-      - name: Set up Go 1.17
+      - name: Set up Go 1.20
         uses: actions/setup-go@v3
         with:
-          go-version: 1.17.x
+          go-version: "1.20"
         id: go
 
       - name: Install regctl
@@ -35,7 +35,7 @@ jobs:
       - name: Prepare
         id: prep
         run: |
-          BASE_NAME="alpine:latest"
+          BASE_NAME="cgr.dev/chainguard/static:latest"
           BASE_DIGEST="$(regctl image digest "${BASE_NAME}")"
           VERSION=noop
           if [ "${{ github.event_name }}" = "schedule" ]; then
@@ -140,9 +140,9 @@ jobs:
       - name: login and push
         run: |
           regctl registry login \
-            -u "${{ secrets.GHCR_USER }}" \
-            -p "${{ secrets.GHCR_TOKEN }}" \
+            -u "${{ github.repository_owner }}" \
+            -p "${{ secrets.GITHUB_TOKEN }}" \
             ghcr.io
           regctl image copy --digest-tags -v info \
             ocidir://oci-layout:latest \
-            ghcr.io/sudo-bmitch/demo-gha-with-oci-layout:${{ steps.prep.outputs.version }}
+            ghcr.io/developer-guy/demo-gha-with-oci-layout:${{ steps.prep.outputs.version }}

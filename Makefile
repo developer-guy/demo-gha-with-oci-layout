@@ -69,8 +69,8 @@ mutate: .FORCE
 	regctl image mod ocidir://oci-layout:latest --replace \
 		--time-max "$(date_git)" \
 		--annotation "org.opencontainers.image.created=$(date_git)" \
-  	--annotation "org.opencontainers.image.base.name=$(base_name)" \
-  	--annotation "org.opencontainers.image.base.digest=$(base_digest)"
+  		--annotation "org.opencontainers.image.base.name=$(base_name)" \
+  		--annotation "org.opencontainers.image.base.digest=$(base_digest)"
 
 # SBOM tools
 sbom-syft: .FORCE

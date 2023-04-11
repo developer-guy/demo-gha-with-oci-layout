@@ -1,6 +1,6 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.5.2
 
-FROM --platform=$BUILDPLATFORM golang:1.17 as build
+FROM --platform=$BUILDPLATFORM golang:1.20 as build
 
 WORKDIR /src
 COPY . /src/
@@ -14,5 +14,5 @@ RUN --mount=type=cache,id=gomod,target=/go/pkg/mod/cache \
     GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 \
     go build -trimpath -ldflags "-s -w -extldflags -static" -o hello .
 
-FROM alpine:latest
+FROM cgr.dev/chainguard/static:latest
 COPY --from=build /src/hello /bin/hello
